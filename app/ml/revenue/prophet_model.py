@@ -22,18 +22,15 @@ class ProphetForecaster:
         self.max_date = None
 
     def train(self, historical_data):
-        """Huấn luyện mô hình Prophet với yếu tố ngày lễ"""
         logger.info("Starting Prophet training")
-        # Chuẩn hóa TransactionDate thành pd.Timestamp
         prophet_df = historical_data.rename(columns={
             'TransactionDate': 'ds',
             'TotalAmount': 'y',
             'IsHoliday': 'holiday'
         })
-        prophet_df['ds'] = pd.to_datetime(prophet_df['ds'])  # Chuyển thành Timestamp
+        prophet_df['ds'] = pd.to_datetime(prophet_df['ds'])
         self.max_date = prophet_df['ds'].max()
 
-        # Định nghĩa ngày lễ
         holidays = prophet_df[prophet_df['holiday'] == 1][['ds']].drop_duplicates()
         holidays['holiday'] = 'holiday_event'
         holidays['lower_window'] = 0
@@ -46,10 +43,9 @@ class ProphetForecaster:
         logger.info("Prophet training completed")
 
     def predict(self, start_date, end_date):
-        """Dự đoán doanh thu với giới hạn tối đa 1 tháng từ ngày cuối"""
         logger.debug(f"Predicting from {start_date} to {end_date}")
-        max_forecast_date = self.max_date + timedelta(days=30)  # Giữ pd.Timestamp
-        if end_date > max_forecast_date.to_pydatetime():  # Chuyển thành datetime.datetime
+        max_forecast_date = self.max_date + timedelta(days=30)
+        if end_date > max_forecast_date.to_pydatetime():
             end_date = max_forecast_date.to_pydatetime()
 
         periods = (end_date - start_date).days + 1
@@ -57,7 +53,9 @@ class ProphetForecaster:
             logger.error(f"Invalid date range: start_date {start_date} > end_date {end_date}")
             raise ValueError("start_date must be before or equal to end_date")
 
-        future = self.model.make_future_dataframe(periods=periods, include_history=False)
-        future = future[future['ds'] >= start_date]
+        # Tạo future DataFrame với ngày chính xác từ start_date
+        future = pd.DataFrame({
+            'ds': pd.date_range(start=start_date, periods=periods, freq='D')
+        })
         forecast = self.model.predict(future)
         return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
