@@ -15,7 +15,7 @@ class ProphetForecaster:
                 yearly_seasonality=True,
                 weekly_seasonality=True,
                 daily_seasonality=False,
-                uncertainty_samples=1000
+                uncertainty_samples=500
             )
         else:
             self.model = model

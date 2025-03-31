@@ -114,6 +114,12 @@ class RevenueForecastService:
 
     def _compare_with_previous(self, current_row, all_data, current_index, days_back):
         if current_index < days_back:
+            current_date = current_row['ds']
+            prev_date = current_date - timedelta(days=days_back)
+            prev_data = self.historical_data[self.historical_data['TransactionDate'] == prev_date]
+            if not prev_data.empty:
+                prev_value = prev_data['TotalAmount'].iloc[0]
+                return ((current_row['combined'] - prev_value) / prev_value) * 100
             return 0.0
         prev_row = all_data.iloc[current_index - days_back]
         return ((current_row['combined'] - prev_row['combined']) / prev_row['combined']) * 100
@@ -146,10 +152,9 @@ class RevenueForecastService:
         max_day = max(forecast_data, key=lambda x: x['predicted_revenue'])
         avg_revenue = np.mean([x['predicted_revenue'] for x in forecast_data])
 
-        if max_day['predicted_revenue'] > avg_revenue * 1.5:
+        if max_day['predicted_revenue'] > avg_revenue * 1.3:  # Giảm từ 1.5 xuống 1.3
             recommendations.append({
                 "type": "staffing",
                 "message": f"Tăng nhân viên vào {max_day['date'].strftime('%A %d/%m')}"
             })
-
         return recommendations
