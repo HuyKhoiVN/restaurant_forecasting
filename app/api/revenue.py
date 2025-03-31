@@ -3,9 +3,10 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel, validator
 from app.services.revenue_service import RevenueForecastService
+import  logging
 
 router = APIRouter()
-
+logger = logging.getLogger(__name__)
 
 class RevenueForecastInput(BaseModel):
     start_date: date
@@ -56,4 +57,5 @@ async def get_revenue_forecast(input: RevenueForecastInput):
             "metadata": metadata
         }
     except Exception as e:
+        logger.error(f"Error in forecast: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))

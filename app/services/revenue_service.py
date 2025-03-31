@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -6,92 +7,78 @@ from app.database import get_db
 from app.ml.revenue.prophet_model import ProphetForecaster
 from app.ml.revenue.lstm_model import LSTMForecaster
 from app.ml.utils import aggregate_data, preprocess_data, apply_pca, apply_kmeans
-import logging
 
-# Thiết lập logging
-logging.basicConfig(level=logging.DEBUG)  # Đổi thành DEBUG để thấy chi tiết hơn
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 class RevenueForecastService:
     def __init__(self):
+        logger.debug("Initializing RevenueForecastService")
         self.prophet = ProphetForecaster()
         self.lstm = LSTMForecaster()
         self._load_historical_data()
         self._preprocess_and_train_models()
 
     def _load_historical_data(self):
-        """Tải dữ liệu lịch sử từ database"""
-        try:
-            db = next(get_db())
-            query = """
-                SELECT 
-                    t.TransactionDate,
-                    SUM(t.TotalAmount) as TotalAmount,
-                    COUNT(*) as TransactionCount,
-                    r.IsHoliday,
-                    r.IsWeekend,
-                    r.Weather
-                FROM [Transaction] t
-                LEFT JOIN Revenue r ON t.TransactionDate = r.Date
-                GROUP BY t.TransactionDate, r.IsHoliday, r.IsWeekend, r.Weather
-                ORDER BY t.TransactionDate
-            """
-            self.historical_data = pd.read_sql(query, db.connection())
-            logger.info(f"Loaded {len(self.historical_data)} rows, TransactionDate type: {type(self.historical_data['TransactionDate'].iloc[0])}")
-        except Exception as e:
-            logger.error(f"Error loading historical data: {e}")
-            raise
+        logger.debug("Loading historical data")
+        db = next(get_db())
+        query = """
+            SELECT 
+                t.TransactionDate,
+                SUM(t.TotalAmount) as TotalAmount,
+                COUNT(*) as TransactionCount,
+                r.IsHoliday,
+                r.IsWeekend,
+                r.Weather
+            FROM [Transaction] t
+            LEFT JOIN Revenue r ON t.TransactionDate = r.Date
+            GROUP BY t.TransactionDate, r.IsHoliday, r.IsWeekend, r.Weather
+            ORDER BY t.TransactionDate
+        """
+        self.historical_data = pd.read_sql(query, db.connection())
+        logger.info(f"Loaded {len(self.historical_data)} rows, TransactionDate type: {type(self.historical_data['TransactionDate'].iloc[0])}")
 
     def _preprocess_and_train_models(self):
-        """Tiền xử lý và huấn luyện mô hình"""
-        try:
-            self.historical_data = preprocess_data(self.historical_data)
-            features = ['TotalAmount', 'TransactionCount']
-            self.historical_data, variance_ratio = apply_pca(self.historical_data, features)
-            logger.info(f"PCA Explained Variance Ratio: {variance_ratio}")
-            self.historical_data = apply_kmeans(self.historical_data)
-            self.prophet.train(self.historical_data)
-            self.lstm.train(self.historical_data)
-            logger.info("Models trained successfully")
-        except Exception as e:
-            logger.error(f"Error in preprocessing or training: {e}")
-            raise
+        logger.debug("Preprocessing and training models")
+        self.historical_data = preprocess_data(self.historical_data)
+        features = ['TotalAmount', 'TransactionCount']
+        self.historical_data, variance_ratio = apply_pca(self.historical_data, features)
+        logger.info(f"PCA Explained Variance Ratio: {variance_ratio}")
+        self.historical_data = apply_kmeans(self.historical_data)
+        self.prophet.train(self.historical_data)
+        self.lstm.train(self.historical_data)
+        logger.info("Models trained successfully")
 
     def generate_forecast(self, start_date: datetime, end_date: datetime,
                           granularity: str = "daily") -> List[Dict]:
-        """Tạo dự đoán doanh thu theo yêu cầu"""
-        try:
-            max_date = self.historical_data['TransactionDate'].max()
-            max_forecast_date = max_date + timedelta(days=30)
-            if end_date > max_forecast_date:
-                end_date = max_forecast_date
-                logger.info(f"End date adjusted to max forecast date: {max_forecast_date}")
+        logger.debug(f"Generating forecast from {start_date} to {end_date}")
+        max_date = self.historical_data['TransactionDate'].max()
+        # Chuyển max_forecast_date thành datetime.datetime
+        max_forecast_date = datetime.combine(max_date, datetime.min.time()) + timedelta(days=30)
+        if end_date > max_forecast_date:
+            logger.info(f"Adjusting end_date from {end_date} to {max_forecast_date}")
+            end_date = max_forecast_date
 
-            prophet_results = self.prophet.predict(start_date, end_date)
-            lstm_results = self.lstm.predict(self._get_last_values(), start_date, end_date)
+        prophet_results = self.prophet.predict(start_date, end_date)
+        lstm_results = self.lstm.predict(self._get_last_values(), start_date, end_date)
 
-            prophet_results['lstm'] = lstm_results
-            prophet_results['combined'] = (prophet_results['yhat'] + prophet_results['lstm']) / 2
-            forecast = aggregate_data(prophet_results, granularity)
-            return self._add_analysis(forecast)
-        except Exception as e:
-            logger.error(f"Error generating forecast: {e}")
-            raise
+        prophet_results['lstm'] = lstm_results
+        prophet_results['combined'] = (prophet_results['yhat'] + prophet_results['lstm']) / 2
+        forecast = aggregate_data(prophet_results, granularity)
+        return self._add_analysis(forecast)
 
     def _get_last_values(self) -> np.ndarray:
         return self.historical_data['TotalAmount'].tail(self.lstm.look_back).values
 
     def _add_analysis(self, forecast: pd.DataFrame) -> List[Dict]:
-        """Thêm trend và comparison vào kết quả dự đoán"""
+        logger.debug(f"Forecast ds type: {type(forecast['ds'].iloc[0])}")
         results = []
         for i, row in forecast.iterrows():
             ds_value = row['ds']
-            # Không gọi .date() nếu đã là datetime.date
             if isinstance(ds_value, pd.Timestamp):
                 ds_value = ds_value.date()
             elif isinstance(ds_value, datetime):
                 ds_value = ds_value.date()
-            # Nếu là datetime.date thì giữ nguyên
 
             result = {
                 "date": ds_value,
