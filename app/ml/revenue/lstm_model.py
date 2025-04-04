@@ -1,69 +1,85 @@
-from datetime import timedelta
+from datetime import timedelta, datetime
 import  logging
 import numpy as np
 import pandas as pd
 from keras.api.models import Sequential
 from keras.api.layers import LSTM, Dense, Dropout, Input
-from sklearn.preprocessing import MinMaxScaler
 from typing import Tuple
+from sklearn.preprocessing import MinMaxScaler
+import optuna
+import tensorflow as tf
 
 logger = logging.getLogger(__name__)
 
 
 class LSTMForecaster:
-    def __init__(self, look_back=30):
-        self.look_back = look_back
-        self.scaler = MinMaxScaler()
-        self.model = self._build_model()
+    def __init__(self, model=None, holidays=None):
+        self.look_back = 7
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
         self.max_date = None
-
-    def _build_model(self) -> Sequential:
-        logger.debug("Building LSTM model")
-        model = Sequential([
-            Input(shape=(self.look_back, 1)),
-            LSTM(64, return_sequences=True),
+        self.holidays = holidays  # Nhận holidays từ bên ngoài
+        self.model = model if model else Sequential([
+            Input(shape=(self.look_back, 3)),  # 3 features: TotalAmount, IsHoliday, IsWeekend
+            LSTM(50, return_sequences=True),
             Dropout(0.2),
-            LSTM(64),
+            LSTM(50),
             Dropout(0.2),
             Dense(1)
         ])
-        model.compile(optimizer='adam', loss='mse')
-        return model
+        if not model:
+            self.model.compile(optimizer='adam', loss='mse')
 
-    def prepare_data(self, data: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
-        if len(data) < self.look_back:
-            logger.error(f"Data length {len(data)} is less than look_back {self.look_back}")
-            raise ValueError("Not enough data for LSTM look_back")
-        scaled_data = self.scaler.fit_transform(data.values.reshape(-1, 1))
+    def prepare_data(self, data):
+        features = data[['TotalAmount', 'IsHoliday', 'IsWeekend']].values
+        scaled_data = self.scaler.fit_transform(features)
         X, y = [], []
-        for i in range(self.look_back, len(scaled_data)):
-            X.append(scaled_data[i - self.look_back:i, 0])
-            y.append(scaled_data[i, 0])
+        for i in range(len(scaled_data) - self.look_back):
+            X.append(scaled_data[i:(i + self.look_back), :])
+            y.append(scaled_data[i + self.look_back, 0])  # Dự đoán TotalAmount
         return np.array(X), np.array(y)
 
     def train(self, historical_data: pd.DataFrame):
         logger.info("Starting LSTM training")
-        # Chuẩn hóa max_date thành pd.Timestamp
         self.max_date = pd.to_datetime(historical_data['TransactionDate'].max())
-        data = historical_data.set_index('TransactionDate')['TotalAmount']
-        X, y = self.prepare_data(data)
-        X = X.reshape(X.shape[0], X.shape[1], 1)
+        X, y = self.prepare_data(historical_data)
         self.model.fit(X, y, epochs=50, batch_size=32, verbose=1)
         logger.info("LSTM training completed")
 
-    def predict(self, last_values: np.ndarray, start_date, end_date) -> np.ndarray:
+    def predict(self, last_values: np.ndarray, start_date: datetime, end_date: datetime):
         logger.debug(f"Predicting from {start_date} to {end_date}")
-        max_forecast_date = self.max_date + timedelta(days=30)
-        if end_date > max_forecast_date.to_pydatetime():  # Giữ to_pydatetime() vì max_date giờ là Timestamp
-            end_date = max_forecast_date.to_pydatetime()
-
         periods = (end_date - start_date).days + 1
+        if periods <= 0:
+            logger.error(f"Invalid date range: start_date {start_date} > end_date {end_date}")
+            raise ValueError("start_date must be before or equal to end_date")
+
+        if self.holidays is None:
+            logger.error("Holidays not provided to LSTMForecaster")
+            raise ValueError("Holidays must be provided for accurate forecasting")
+
+        # Chuẩn bị dữ liệu đầu vào với IsHoliday và IsWeekend
+        last_data = pd.DataFrame({
+            'TotalAmount': last_values[-self.look_back:],
+            'IsHoliday': [1 if d in self.holidays['ds'].values else 0 for d in
+                          pd.date_range(end_date - timedelta(days=self.look_back - 1), periods=self.look_back)],
+            'IsWeekend': [(d.weekday() >= 5) for d in
+                          pd.date_range(end_date - timedelta(days=self.look_back - 1), periods=self.look_back)]
+        })
+        last_scaled = self.scaler.transform(last_data[['TotalAmount', 'IsHoliday', 'IsWeekend']])
+
         predictions = []
-        current_batch = last_values[-self.look_back:].reshape(1, self.look_back, 1)
-
+        current_input = last_scaled.reshape(1, self.look_back, 3)
         for _ in range(periods):
-            current_pred = self.model.predict(current_batch, verbose=0)[0]
-            predictions.append(current_pred[0])
-            current_batch = np.append(current_batch[:, 1:, :], [[current_pred]], axis=1)
+            next_pred = self.model.predict(current_input, verbose=0)
+            predictions.append(next_pred[0, 0])
+            next_date = start_date + timedelta(days=len(predictions))
+            next_row = np.array([[next_pred[0, 0],
+                                  1 if next_date in self.holidays['ds'].values else 0,
+                                  1 if next_date.weekday() >= 5 else 0]])
+            next_scaled = self.scaler.transform(next_row)[0]
+            current_input = np.append(current_input[:, 1:, :], [[next_scaled]], axis=1)
 
-        return self.scaler.inverse_transform(np.array(predictions).reshape(-1, 1)).flatten()
+        predictions = np.array(predictions).reshape(-1, 1)
+        dummy = np.zeros((len(predictions), 2))  # Để inverse_transform
+        predictions_full = np.hstack([predictions, dummy])
+        predictions = self.scaler.inverse_transform(predictions_full)[:, 0]
+        return predictions

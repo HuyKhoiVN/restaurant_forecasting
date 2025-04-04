@@ -7,17 +7,20 @@ from app.database import get_db
 from app.ml.revenue.prophet_model import ProphetForecaster
 from app.ml.revenue.lstm_model import LSTMForecaster
 from app.ml.utils import aggregate_data, preprocess_data, apply_pca, apply_kmeans
+from sklearn.metrics import mean_absolute_percentage_error
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
 
 class RevenueForecastService:
     def __init__(self):
         logger.debug("Initializing RevenueForecastService")
         self.prophet = ProphetForecaster()
-        self.lstm = LSTMForecaster()
+        self.lstm = LSTMForecaster(holidays=self.prophet.holidays)  # Truyền holidays từ Prophet
         self._load_historical_data()
         self._preprocess_and_train_models()
+        self.weights = self._optimize_weights()
 
     def _load_historical_data(self):
         logger.debug("Loading historical data")
@@ -35,25 +38,50 @@ class RevenueForecastService:
             GROUP BY t.TransactionDate, r.IsHoliday, r.IsWeekend, r.Weather
             ORDER BY t.TransactionDate
         """
-        self.historical_data = pd.read_sql(query, db.connection())
-        logger.info(f"Loaded {len(self.historical_data)} rows, TransactionDate type: {type(self.historical_data['TransactionDate'].iloc[0])}")
+        raw_data = pd.read_sql(query, db.connection())
+        raw_data['TransactionDate'] = pd.to_datetime(raw_data['TransactionDate'])
+        all_dates = pd.date_range(start=raw_data['TransactionDate'].min(),
+                                  end=raw_data['TransactionDate'].max(), freq='D')
+        self.historical_data = pd.DataFrame({'TransactionDate': all_dates})
+        self.historical_data = self.historical_data.merge(raw_data, on='TransactionDate', how='left')
+        self.historical_data['TotalAmount'] = self.historical_data['TotalAmount'].fillna(0)
+        self.historical_data.fillna({'TransactionCount': 0, 'IsHoliday': 0, 'IsWeekend': 0, 'Weather': 'Unknown'},
+                                    inplace=True)
+        logger.info(f"Loaded {len(self.historical_data)} rows after filling missing dates")
 
     def _preprocess_and_train_models(self):
         logger.debug("Preprocessing and training models")
         self.historical_data = preprocess_data(self.historical_data)
-        features = ['TotalAmount', 'TransactionCount']
+        features = ['TotalAmount', 'TransactionCount', 'weather_holiday_interaction']
         self.historical_data, variance_ratio = apply_pca(self.historical_data, features)
         logger.info(f"PCA Explained Variance Ratio: {variance_ratio}")
         self.historical_data = apply_kmeans(self.historical_data)
-        self.prophet.train(self.historical_data)
-        self.lstm.train(self.historical_data)
-        logger.info("Models trained successfully")
 
-    def generate_forecast(self, start_date: datetime, end_date: datetime,
-                          granularity: str = "daily") -> List[Dict]:
+        prophet_data = self.historical_data[
+            ['TransactionDate', 'TotalAmount', 'IsHoliday', 'IsWeekend', 'PCA1', 'PCA2']]
+        self.prophet.train(prophet_data)
+        self.lstm.train(prophet_data)
+
+    def _optimize_weights(self):
+        train_data = self.historical_data.iloc[:-30]
+        val_data = self.historical_data.iloc[-30:]
+
+        prophet_val = self.prophet.predict(val_data['TransactionDate'].min(), val_data['TransactionDate'].max())
+        lstm_val = self.lstm.predict(train_data['TotalAmount'].tail(self.lstm.look_back).values,
+                                     val_data['TransactionDate'].min(), val_data['TransactionDate'].max())
+
+        prophet_mape = mean_absolute_percentage_error(val_data['TotalAmount'], prophet_val['yhat'])
+        lstm_mape = mean_absolute_percentage_error(val_data['TotalAmount'], lstm_val)
+
+        total_error = prophet_mape + lstm_mape
+        w_prophet = lstm_mape / total_error
+        w_lstm = prophet_mape / total_error
+        logger.info(f"Optimized weights - Prophet: {w_prophet:.2f}, LSTM: {w_lstm:.2f}")
+        return {'prophet': w_prophet, 'lstm': w_lstm}
+
+    def generate_forecast(self, start_date: datetime, end_date: datetime, granularity: str = "daily") -> List[Dict]:
         logger.debug(f"Generating forecast from {start_date} to {end_date}")
         max_date = self.historical_data['TransactionDate'].max()
-        # Chuyển max_forecast_date thành datetime.datetime
         max_forecast_date = datetime.combine(max_date, datetime.min.time()) + timedelta(days=30)
         if end_date > max_forecast_date:
             logger.info(f"Adjusting end_date from {end_date} to {max_forecast_date}")
@@ -63,7 +91,9 @@ class RevenueForecastService:
         lstm_results = self.lstm.predict(self._get_last_values(), start_date, end_date)
 
         prophet_results['lstm'] = lstm_results
-        prophet_results['combined'] = (prophet_results['yhat'] + prophet_results['lstm']) / 2
+        prophet_results['combined'] = (self.weights['prophet'] * prophet_results['yhat'] +
+                                       self.weights['lstm'] * prophet_results['lstm'])
+        prophet_results['combined'] = prophet_results['combined'].clip(lower=0)
         forecast = aggregate_data(prophet_results, granularity)
         return self._add_analysis(forecast)
 
@@ -71,22 +101,13 @@ class RevenueForecastService:
         return self.historical_data['TotalAmount'].tail(self.lstm.look_back).values
 
     def _add_analysis(self, forecast: pd.DataFrame) -> List[Dict]:
-        logger.debug(f"Forecast ds type: {type(forecast['ds'].iloc[0])}")
         results = []
         for i, row in forecast.iterrows():
-            ds_value = row['ds']
-            if isinstance(ds_value, pd.Timestamp):
-                ds_value = ds_value.date()
-            elif isinstance(ds_value, datetime):
-                ds_value = ds_value.date()
-
+            ds_value = row['ds'].date() if isinstance(row['ds'], pd.Timestamp) else row['ds']
             result = {
                 "date": ds_value,
                 "predicted_revenue": row['combined'],
-                "confidence_interval": {
-                    "lower": row['yhat_lower'],
-                    "upper": row['yhat_upper']
-                },
+                "confidence_interval": {"lower": row['yhat_lower'], "upper": row['yhat_upper']},
                 "trend": self._calculate_trend(row, forecast, i),
                 "trend_percentage": self._calculate_trend_percentage(row, forecast, i),
                 "comparison": {
@@ -99,8 +120,7 @@ class RevenueForecastService:
         return results
 
     def _calculate_trend(self, current_row, all_data, current_index):
-        if current_index == 0:
-            return "stable"
+        if current_index == 0: return "stable"
         prev_row = all_data.iloc[current_index - 1]
         if current_row['combined'] > prev_row['combined'] * 1.05:
             return "increase"
@@ -123,38 +143,3 @@ class RevenueForecastService:
             return 0.0
         prev_row = all_data.iloc[current_index - days_back]
         return ((current_row['combined'] - prev_row['combined']) / prev_row['combined']) * 100
-
-    def generate_analysis(self, forecast_data):
-        return {
-            "seasonality_patterns": self._detect_seasonality(forecast_data),
-            "action_recommendations": self._generate_recommendations(forecast_data)
-        }
-
-    def _detect_seasonality(self, forecast_data):
-        patterns = []
-        weekday_data = [x for x in forecast_data if x['date'].weekday() < 5]
-        weekend_data = [x for x in forecast_data if x['date'].weekday() >= 5]
-
-        if weekend_data and weekday_data:
-            weekday_avg = np.mean([x['predicted_revenue'] for x in weekday_data])
-            weekend_avg = np.mean([x['predicted_revenue'] for x in weekend_data])
-
-            if weekend_avg > weekday_avg * 1.2:
-                patterns.append({
-                    "pattern": "weekend_high",
-                    "impact": round(((weekend_avg / weekday_avg) - 1) * 100, 1)
-                })
-
-        return patterns
-
-    def _generate_recommendations(self, forecast_data):
-        recommendations = []
-        max_day = max(forecast_data, key=lambda x: x['predicted_revenue'])
-        avg_revenue = np.mean([x['predicted_revenue'] for x in forecast_data])
-
-        if max_day['predicted_revenue'] > avg_revenue * 1.3:  # Giảm từ 1.5 xuống 1.3
-            recommendations.append({
-                "type": "staffing",
-                "message": f"Tăng nhân viên vào {max_day['date'].strftime('%A %d/%m')}"
-            })
-        return recommendations
