@@ -11,7 +11,6 @@ import tensorflow as tf
 
 logger = logging.getLogger(__name__)
 
-
 class LSTMForecaster:
     def __init__(self, model=None, holidays=None):
         self.look_back = 30
@@ -30,8 +29,9 @@ class LSTMForecaster:
             self.model.compile(optimizer='adam', loss='mse')
 
     def prepare_data(self, data):
-        total_amount = data[['TotalAmount']].values.astype(float)
-        scaled_total = self.scaler.fit_transform(total_amount)
+        total_amount = data[data['TotalAmount'] > 0][['TotalAmount']].values.astype(float)
+        self.scaler.fit(total_amount)
+        scaled_total = self.scaler.transform(data[['TotalAmount']].values.astype(float))
         features = np.hstack([scaled_total, data[['IsHoliday', 'IsWeekend']].values.astype(float)])
         X, y = [], []
         for i in range(len(features) - self.look_back):
@@ -43,7 +43,7 @@ class LSTMForecaster:
         logger.info("Starting LSTM training")
         self.max_date = pd.to_datetime(historical_data['TransactionDate'].max())
         X, y = self.prepare_data(historical_data)
-        self.model.fit(X, y, epochs=100, batch_size=32, verbose=1)  # Tăng epochs
+        self.model.fit(X, y, epochs=100, batch_size=32, verbose=1)
         logger.info("LSTM training completed")
 
     def predict(self, last_values: np.ndarray, start_date: datetime, end_date: datetime):
@@ -80,5 +80,5 @@ class LSTMForecaster:
 
         predictions = np.array(predictions).reshape(-1, 1)
         predictions = self.scaler.inverse_transform(predictions).flatten()
-        logger.debug(f"LSTM predictions: {predictions.tolist()}")
-        return np.clip(predictions, a_min=0, a_max=None)
+        logger.debug(f"LSTM predictions after inverse: {predictions.tolist()}")
+        return predictions

@@ -1,58 +1,48 @@
-from fastapi import APIRouter, Depends, HTTPException
-from datetime import date, datetime, timedelta
-from typing import Optional
-from pydantic import BaseModel, validator
+from fastapi import APIRouter, HTTPException
+from datetime import datetime, timedelta
+from typing import Dict
+from pydantic import BaseModel
 from app.services.revenue_service import RevenueForecastService
 import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-class RevenueForecastInput(BaseModel):
-    start_date: date
-    end_date: date
+
+class ForecastRequest(BaseModel):
+    start_date: datetime  # Trực tiếp dùng datetime thay vì str
+    end_date: datetime  # Trực tiếp dùng datetime thay vì str
     include_analysis: bool = True
     granularity: str = "daily"
 
-    @validator("end_date")
-    def validate_end_date(cls, v, values):
-        if v < values["start_date"]:
-            raise ValueError("end_date must be after start_date")
-        return v
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.strftime("%Y-%m-%d")  # Định dạng datetime trong JSON response
+        }
 
-class RevenueForecastOutput(BaseModel):
-    status: str
-    forecast: list
-    analysis: Optional[dict]
-    metadata: dict
 
-@router.post("/forecast", response_model=RevenueForecastOutput)
-async def get_revenue_forecast(input: RevenueForecastInput):
+@router.post("/api/revenue/forecast")
+async def get_revenue_forecast(request: ForecastRequest) -> Dict:
     try:
         service = RevenueForecastService()
-        start_date = datetime.combine(input.start_date, datetime.min.time())
-        end_date = datetime.combine(input.end_date, datetime.min.time())
-
         forecast, analysis = service.generate_forecast(
-            start_date=start_date,
-            end_date=end_date,
-            granularity=input.granularity
+            request.start_date,
+            request.end_date,
+            request.granularity
         )
 
-        analysis_result = analysis if input.include_analysis else None
-
-        metadata = {
-            "model_used": "Prophet + LSTM Ensemble",
-            "last_trained": datetime.now().isoformat(),
-            "max_forecast_date": (service.historical_data['TransactionDate'].max() + timedelta(days=30)).isoformat()
-        }
-
-        return {
+        response = {
             "status": "success",
             "forecast": forecast,
-            "analysis": analysis_result,
-            "metadata": metadata
+            "metadata": {
+                "model_used": "Prophet + LSTM Ensemble",
+                "last_trained": datetime.now().isoformat(),
+                "max_forecast_date": (service.historical_data['TransactionDate'].max() + timedelta(days=30)).isoformat()
+            }
         }
+        if request.include_analysis:
+            response["analysis"] = analysis
+        return response
     except Exception as e:
         logger.error(f"Error in forecast: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error generating forecast: {str(e)}")

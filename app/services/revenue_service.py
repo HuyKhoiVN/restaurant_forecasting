@@ -103,8 +103,7 @@ class RevenueForecastService:
         prophet_results['lstm'] = lstm_results
         prophet_results['combined'] = (self.weights['prophet'] * prophet_results['yhat'] +
                                        self.weights['lstm'] * prophet_results['lstm'])
-        logger.debug(f"Combined before clip: {prophet_results['combined'].tolist()}")
-        prophet_results['combined'] = prophet_results['combined'].clip(lower=2000000)  # Giữ để debug
+        logger.debug(f"Combined forecast: {prophet_results['combined'].tolist()}")
         forecast_df = aggregate_data(prophet_results, granularity)
         logger.debug(f"Forecast combined values: {forecast_df['combined'].tolist()}")
 
@@ -133,11 +132,34 @@ class RevenueForecastService:
             "decrease_days": trends.count("decrease"),
             "stable_days": trends.count("stable")
         }
+
+        # Phân tích kinh tế
+        historical_avg = self.historical_data['TotalAmount'].mean()
+        forecast_avg = avg_revenue
+        revenue_growth = ((forecast_avg - historical_avg) / historical_avg * 100) if historical_avg > 0 else 0
+
+        # Giả định chi phí cố định 20M/ngày, lợi nhuận ròng = doanh thu - chi phí
+        fixed_cost_per_day = 20_000_000
+        profit_margin = ((forecast_avg - fixed_cost_per_day) / forecast_avg * 100) if forecast_avg > 0 else 0
+
+        # Gợi ý dựa trên xu hướng
+        suggestions = []
+        if trend_summary['increase_days'] > trend_summary['decrease_days']:
+            suggestions.append(
+                "Doanh thu dự kiến tăng, cân nhắc tăng cường nhân sự hoặc tồn kho vào cuối tuần/ngày lễ.")
+        if max_revenue > historical_avg * 1.5:
+            suggestions.append("Có ngày doanh thu cao bất thường, kiểm tra ngày lễ hoặc sự kiện đặc biệt để chuẩn bị.")
+        if profit_margin < 10:
+            suggestions.append("Lợi nhuận ròng thấp, xem xét giảm chi phí hoặc tăng giá bán.")
+
         return {
             "average_revenue": float(avg_revenue) if not pd.isna(avg_revenue) else 0,
             "max_revenue": float(max_revenue) if not pd.isna(max_revenue) else 0,
             "min_revenue": float(min_revenue) if not pd.isna(min_revenue) else 0,
-            "trend_summary": trend_summary
+            "trend_summary": trend_summary,
+            "revenue_growth_percent": float(revenue_growth),
+            "profit_margin_percent": float(profit_margin),
+            "suggestions": suggestions
         }
 
     def _calculate_trend(self, current_row, all_data, current_index):
