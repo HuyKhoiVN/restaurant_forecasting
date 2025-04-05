@@ -14,15 +14,15 @@ logger = logging.getLogger(__name__)
 
 class LSTMForecaster:
     def __init__(self, model=None, holidays=None):
-        self.look_back = 7
+        self.look_back = 30
         self.scaler = MinMaxScaler(feature_range=(0, 1))
         self.max_date = None
-        self.holidays = holidays  # Nhận holidays từ bên ngoài
+        self.holidays = holidays
         self.model = model if model else Sequential([
-            Input(shape=(self.look_back, 3)),  # 3 features: TotalAmount, IsHoliday, IsWeekend
-            LSTM(50, return_sequences=True),
+            Input(shape=(self.look_back, 3)),
+            LSTM(100, return_sequences=True),
             Dropout(0.2),
-            LSTM(50),
+            LSTM(100),
             Dropout(0.2),
             Dense(1)
         ])
@@ -30,56 +30,55 @@ class LSTMForecaster:
             self.model.compile(optimizer='adam', loss='mse')
 
     def prepare_data(self, data):
-        features = data[['TotalAmount', 'IsHoliday', 'IsWeekend']].values
-        scaled_data = self.scaler.fit_transform(features)
+        total_amount = data[['TotalAmount']].values.astype(float)
+        scaled_total = self.scaler.fit_transform(total_amount)
+        features = np.hstack([scaled_total, data[['IsHoliday', 'IsWeekend']].values.astype(float)])
         X, y = [], []
-        for i in range(len(scaled_data) - self.look_back):
-            X.append(scaled_data[i:(i + self.look_back), :])
-            y.append(scaled_data[i + self.look_back, 0])  # Dự đoán TotalAmount
-        return np.array(X), np.array(y)
+        for i in range(len(features) - self.look_back):
+            X.append(features[i:(i + self.look_back), :])
+            y.append(scaled_total[i + self.look_back, 0])
+        return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
     def train(self, historical_data: pd.DataFrame):
         logger.info("Starting LSTM training")
         self.max_date = pd.to_datetime(historical_data['TransactionDate'].max())
         X, y = self.prepare_data(historical_data)
-        self.model.fit(X, y, epochs=50, batch_size=32, verbose=1)
+        self.model.fit(X, y, epochs=100, batch_size=32, verbose=1)  # Tăng epochs
         logger.info("LSTM training completed")
 
     def predict(self, last_values: np.ndarray, start_date: datetime, end_date: datetime):
         logger.debug(f"Predicting from {start_date} to {end_date}")
         periods = (end_date - start_date).days + 1
         if periods <= 0:
-            logger.error(f"Invalid date range: start_date {start_date} > end_date {end_date}")
             raise ValueError("start_date must be before or equal to end_date")
-
         if self.holidays is None:
-            logger.error("Holidays not provided to LSTMForecaster")
-            raise ValueError("Holidays must be provided for accurate forecasting")
+            raise ValueError("Holidays must be provided")
 
-        # Chuẩn bị dữ liệu đầu vào với IsHoliday và IsWeekend
-        last_data = pd.DataFrame({
-            'TotalAmount': last_values[-self.look_back:],
-            'IsHoliday': [1 if d in self.holidays['ds'].values else 0 for d in
-                          pd.date_range(end_date - timedelta(days=self.look_back - 1), periods=self.look_back)],
-            'IsWeekend': [(d.weekday() >= 5) for d in
-                          pd.date_range(end_date - timedelta(days=self.look_back - 1), periods=self.look_back)]
-        })
-        last_scaled = self.scaler.transform(last_data[['TotalAmount', 'IsHoliday', 'IsWeekend']])
+        dates = pd.date_range(end_date - timedelta(days=self.look_back - 1), periods=self.look_back)
+        last_data = np.hstack([
+            last_values[-self.look_back:].reshape(-1, 1),
+            np.array([1 if d in self.holidays['ds'].values else 0 for d in dates]).reshape(-1, 1),
+            np.array([(d.weekday() >= 5) for d in dates]).reshape(-1, 1)
+        ]).astype(float)
+        scaled_total = self.scaler.transform(last_data[:, [0]])
+        last_scaled = np.hstack([scaled_total, last_data[:, 1:]]).astype(np.float32)
 
         predictions = []
         current_input = last_scaled.reshape(1, self.look_back, 3)
-        for _ in range(periods):
-            next_pred = self.model.predict(current_input, verbose=0)
-            predictions.append(next_pred[0, 0])
-            next_date = start_date + timedelta(days=len(predictions))
-            next_row = np.array([[next_pred[0, 0],
-                                  1 if next_date in self.holidays['ds'].values else 0,
-                                  1 if next_date.weekday() >= 5 else 0]])
-            next_scaled = self.scaler.transform(next_row)[0]
-            current_input = np.append(current_input[:, 1:, :], [[next_scaled]], axis=1)
+        for i in range(periods):
+            next_pred = self.model.predict(current_input, verbose=0)[0, 0]
+            predictions.append(next_pred)
+            next_date = start_date + timedelta(days=i + 1)
+            next_features = np.array([
+                next_pred,
+                1 if next_date in self.holidays['ds'].values else 0,
+                1 if next_date.weekday() >= 5 else 0
+            ]).reshape(1, -1).astype(float)
+            next_scaled_total = self.scaler.transform(next_features[:, [0]])
+            next_input = np.hstack([next_scaled_total, next_features[:, 1:]]).astype(np.float32)
+            current_input = np.append(current_input[:, 1:, :], next_input.reshape(1, 1, 3), axis=1)
 
         predictions = np.array(predictions).reshape(-1, 1)
-        dummy = np.zeros((len(predictions), 2))  # Để inverse_transform
-        predictions_full = np.hstack([predictions, dummy])
-        predictions = self.scaler.inverse_transform(predictions_full)[:, 0]
-        return predictions
+        predictions = self.scaler.inverse_transform(predictions).flatten()
+        logger.debug(f"LSTM predictions: {predictions.tolist()}")
+        return np.clip(predictions, a_min=0, a_max=None)
