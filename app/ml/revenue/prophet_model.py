@@ -14,7 +14,7 @@ class ProphetForecaster:
         self.holidays = self._add_tet_holidays()
         self.model.holidays = self.holidays
         self.max_date = None
-        self.training_data = None  # Thêm để lưu dữ liệu huấn luyện
+        self.training_data = None
 
     def _add_tet_holidays(self):
         tet_dates = []
@@ -37,11 +37,9 @@ class ProphetForecaster:
         df['IsWeekend'] = df['IsWeekend'].astype(int)
         self.model.add_regressor('IsHoliday')
         self.model.add_regressor('IsWeekend')
-        self.model.add_regressor('PCA1')
-        self.model.add_regressor('PCA2')
         self.model.fit(df)
         self.max_date = df['ds'].max()
-        self.training_data = df  # Lưu dữ liệu huấn luyện
+        self.training_data = df
         logger.info("Prophet training completed")
 
     def predict(self, start_date: datetime, end_date: datetime):
@@ -50,8 +48,5 @@ class ProphetForecaster:
         future = pd.DataFrame({'ds': future_dates})
         future['IsHoliday'] = future['ds'].apply(lambda x: 1 if x in self.holidays['ds'].values else 0)
         future['IsWeekend'] = future['ds'].apply(lambda x: 1 if x.weekday() >= 5 else 0)
-        historical_pca = self.training_data[['PCA1', 'PCA2']].mean()  # Sử dụng dữ liệu đã lưu
-        future['PCA1'] = historical_pca['PCA1']
-        future['PCA2'] = historical_pca['PCA2']
         forecast = self.model.predict(future)
         return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]

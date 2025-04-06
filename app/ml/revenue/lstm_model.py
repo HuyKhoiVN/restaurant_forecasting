@@ -11,6 +11,7 @@ import tensorflow as tf
 
 logger = logging.getLogger(__name__)
 
+
 class LSTMForecaster:
     def __init__(self, model=None, holidays=None):
         self.look_back = 30
@@ -29,10 +30,14 @@ class LSTMForecaster:
             self.model.compile(optimizer='adam', loss='mse')
 
     def prepare_data(self, data):
-        total_amount = data[data['TotalAmount'] > 0][['TotalAmount']].values.astype(float)
-        self.scaler.fit(total_amount)
-        scaled_total = self.scaler.transform(data[['TotalAmount']].values.astype(float))
-        features = np.hstack([scaled_total, data[['IsHoliday', 'IsWeekend']].values.astype(float)])
+        # Chỉ scale TotalAmount, giữ nguyên thang đo gốc sau khi inverse
+        total_amount = data[['TotalAmount']].values.astype(float)
+        self.scaler.fit(total_amount)  # Fit trên dữ liệu gốc (triệu VND)
+        scaled_total = self.scaler.transform(total_amount)
+        features = np.hstack([
+            scaled_total,
+            data[['IsHoliday', 'IsWeekend']].values.astype(float)
+        ])
         X, y = [], []
         for i in range(len(features) - self.look_back):
             X.append(features[i:(i + self.look_back), :])
@@ -54,6 +59,7 @@ class LSTMForecaster:
         if self.holidays is None:
             raise ValueError("Holidays must be provided")
 
+        # Chuẩn bị dữ liệu ban đầu từ last_values (triệu VND)
         dates = pd.date_range(end_date - timedelta(days=self.look_back - 1), periods=self.look_back)
         last_data = np.hstack([
             last_values[-self.look_back:].reshape(-1, 1),
@@ -68,17 +74,17 @@ class LSTMForecaster:
         for i in range(periods):
             next_pred = self.model.predict(current_input, verbose=0)[0, 0]
             predictions.append(next_pred)
-            next_date = start_date + timedelta(days=i + 1)
+            next_date = start_date + timedelta(days=i)
             next_features = np.array([
                 next_pred,
                 1 if next_date in self.holidays['ds'].values else 0,
                 1 if next_date.weekday() >= 5 else 0
             ]).reshape(1, -1).astype(float)
-            next_scaled_total = self.scaler.transform(next_features[:, [0]])
+            next_scaled_total = self.scaler.transform(next_features[:, [0]].reshape(-1, 1))
             next_input = np.hstack([next_scaled_total, next_features[:, 1:]]).astype(np.float32)
             current_input = np.append(current_input[:, 1:, :], next_input.reshape(1, 1, 3), axis=1)
 
         predictions = np.array(predictions).reshape(-1, 1)
-        predictions = self.scaler.inverse_transform(predictions).flatten()
+        predictions = self.scaler.inverse_transform(predictions).flatten()  # Trả về triệu VND
         logger.debug(f"LSTM predictions after inverse: {predictions.tolist()}")
         return predictions

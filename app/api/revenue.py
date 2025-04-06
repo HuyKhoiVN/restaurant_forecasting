@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from datetime import datetime, timedelta
 from typing import Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.services.revenue_service import RevenueForecastService
 import logging
 
@@ -10,26 +10,26 @@ logger = logging.getLogger(__name__)
 
 
 class ForecastRequest(BaseModel):
-    start_date: datetime  # Trực tiếp dùng datetime thay vì str
-    end_date: datetime  # Trực tiếp dùng datetime thay vì str
+    start_date: datetime = Field(..., format="date", description="Start date in YYYY-MM-DD format")
+    end_date: datetime = Field(..., format="date", description="End date in YYYY-MM-DD format")
     include_analysis: bool = True
     granularity: str = "daily"
 
     class Config:
         json_encoders = {
-            datetime: lambda v: v.strftime("%Y-%m-%d")  # Định dạng datetime trong JSON response
+            datetime: lambda v: v.strftime("%Y-%m-%d")
         }
 
 
 @router.post("/api/revenue/forecast")
 async def get_revenue_forecast(request: ForecastRequest) -> Dict:
     try:
+        # Loại bỏ múi giờ để đồng bộ với dữ liệu trong DB
+        start_date = request.start_date.replace(tzinfo=None)
+        end_date = request.end_date.replace(tzinfo=None)
+
         service = RevenueForecastService()
-        forecast, analysis = service.generate_forecast(
-            request.start_date,
-            request.end_date,
-            request.granularity
-        )
+        forecast, analysis = service.generate_forecast(start_date, end_date, request.granularity)
 
         response = {
             "status": "success",

@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 from app.database import get_db
 from app.ml.revenue.prophet_model import ProphetForecaster
 from app.ml.revenue.lstm_model import LSTMForecaster
-from app.ml.utils import aggregate_data, preprocess_data, apply_pca, apply_kmeans
+from app.ml.utils import aggregate_data
 from sklearn.metrics import mean_absolute_percentage_error
 
 logging.basicConfig(level=logging.DEBUG)
@@ -19,7 +19,7 @@ class RevenueForecastService:
         self.prophet = ProphetForecaster()
         self.lstm = LSTMForecaster(holidays=self.prophet.holidays)
         self._load_historical_data()
-        self._preprocess_and_train_models()
+        self._train_models()
         self.weights = self._optimize_weights()
 
     def _load_historical_data(self):
@@ -48,18 +48,10 @@ class RevenueForecastService:
         self.historical_data.fillna({'TransactionCount': 0, 'IsHoliday': 0, 'IsWeekend': 0, 'Weather': 'Unknown'},
                                     inplace=True)
         logger.info(f"Loaded {len(self.historical_data)} rows after filling missing dates")
-        logger.debug(f"Historical data sample: {self.historical_data.tail(5).to_dict()}")
 
-    def _preprocess_and_train_models(self):
+    def _train_models(self):
         logger.debug("Preprocessing and training models")
-        self.historical_data = preprocess_data(self.historical_data)
-        features = ['TotalAmount', 'TransactionCount', 'weather_holiday_interaction']
-        self.historical_data, variance_ratio = apply_pca(self.historical_data, features)
-        logger.info(f"PCA Explained Variance Ratio: {variance_ratio}")
-        self.historical_data = apply_kmeans(self.historical_data)
-
-        prophet_data = self.historical_data[
-            ['TransactionDate', 'TotalAmount', 'IsHoliday', 'IsWeekend', 'PCA1', 'PCA2']]
+        prophet_data = self.historical_data[['TransactionDate', 'TotalAmount', 'IsHoliday', 'IsWeekend']]
         self.prophet.train(prophet_data)
         self.lstm.train(prophet_data)
 
@@ -73,10 +65,10 @@ class RevenueForecastService:
         lstm_val = self.lstm.predict(train_data['TotalAmount'].tail(self.lstm.look_back).values,
                                      start_date, end_date)
 
-        prophet_val = prophet_val.tail(30)
+        prophet_val = prophet_val['yhat'].tail(30).values
         lstm_val = lstm_val[-30:]
 
-        prophet_mape = mean_absolute_percentage_error(val_data['TotalAmount'], prophet_val['yhat'])
+        prophet_mape = mean_absolute_percentage_error(val_data['TotalAmount'], prophet_val)
         lstm_mape = mean_absolute_percentage_error(val_data['TotalAmount'], lstm_val)
 
         total_error = prophet_mape + lstm_mape
@@ -89,7 +81,7 @@ class RevenueForecastService:
         List[Dict], Dict]:
         logger.debug(f"Generating forecast from {start_date} to {end_date}")
         max_date = self.historical_data['TransactionDate'].max()
-        max_forecast_date = datetime.combine(max_date, datetime.min.time()) + timedelta(days=30)
+        max_forecast_date = max_date + timedelta(days=30)
         if end_date > max_forecast_date:
             logger.info(f"Adjusting end_date from {end_date} to {max_forecast_date}")
             end_date = max_forecast_date
@@ -97,25 +89,19 @@ class RevenueForecastService:
         prophet_results = self.prophet.predict(start_date, end_date)
         lstm_results = self.lstm.predict(self._get_last_values(), start_date, end_date)
 
-        logger.debug(f"Prophet yhat: {prophet_results['yhat'].tolist()}")
-        logger.debug(f"LSTM results: {lstm_results.tolist()}")
-
         prophet_results['lstm'] = lstm_results
         prophet_results['combined'] = (self.weights['prophet'] * prophet_results['yhat'] +
                                        self.weights['lstm'] * prophet_results['lstm'])
-        logger.debug(f"Combined forecast: {prophet_results['combined'].tolist()}")
-        forecast_df = aggregate_data(prophet_results, granularity)
-        logger.debug(f"Forecast combined values: {forecast_df['combined'].tolist()}")
 
-        forecast = []
-        for i, row in forecast_df.iterrows():
-            ds_value = row['ds'].date() if isinstance(row['ds'], pd.Timestamp) else row['ds']
-            forecast.append({
-                "date": ds_value,
+        forecast_df = aggregate_data(prophet_results, granularity)
+        forecast = [
+            {
+                "date": row['ds'].date(),
                 "predicted_revenue": float(row['combined']),
                 "confidence_interval": {"lower": float(row['yhat_lower']), "upper": float(row['yhat_upper'])}
-            })
-
+            }
+            for _, row in forecast_df.iterrows()
+        ]
         analysis = self._add_analysis(forecast_df)
         return forecast, analysis
 
@@ -132,34 +118,11 @@ class RevenueForecastService:
             "decrease_days": trends.count("decrease"),
             "stable_days": trends.count("stable")
         }
-
-        # Phân tích kinh tế
-        historical_avg = self.historical_data['TotalAmount'].mean()
-        forecast_avg = avg_revenue
-        revenue_growth = ((forecast_avg - historical_avg) / historical_avg * 100) if historical_avg > 0 else 0
-
-        # Giả định chi phí cố định 20M/ngày, lợi nhuận ròng = doanh thu - chi phí
-        fixed_cost_per_day = 20_000_000
-        profit_margin = ((forecast_avg - fixed_cost_per_day) / forecast_avg * 100) if forecast_avg > 0 else 0
-
-        # Gợi ý dựa trên xu hướng
-        suggestions = []
-        if trend_summary['increase_days'] > trend_summary['decrease_days']:
-            suggestions.append(
-                "Doanh thu dự kiến tăng, cân nhắc tăng cường nhân sự hoặc tồn kho vào cuối tuần/ngày lễ.")
-        if max_revenue > historical_avg * 1.5:
-            suggestions.append("Có ngày doanh thu cao bất thường, kiểm tra ngày lễ hoặc sự kiện đặc biệt để chuẩn bị.")
-        if profit_margin < 10:
-            suggestions.append("Lợi nhuận ròng thấp, xem xét giảm chi phí hoặc tăng giá bán.")
-
         return {
             "average_revenue": float(avg_revenue) if not pd.isna(avg_revenue) else 0,
             "max_revenue": float(max_revenue) if not pd.isna(max_revenue) else 0,
             "min_revenue": float(min_revenue) if not pd.isna(min_revenue) else 0,
-            "trend_summary": trend_summary,
-            "revenue_growth_percent": float(revenue_growth),
-            "profit_margin_percent": float(profit_margin),
-            "suggestions": suggestions
+            "trend_summary": trend_summary
         }
 
     def _calculate_trend(self, current_row, all_data, current_index):
