@@ -36,14 +36,14 @@ class ProductForecaster:
 
         # Chuyển đổi định dạng
         df['TransactionDate'] = pd.to_datetime(df['TransactionDate'])
-        df['Hour'] = df['TransactionTime'].dt.components['hours']
+        df['Hour'] = df['TransactionTime'].dt.components['hours']  # Trích xuất Hour
 
         # Tạo đặc trưng mới
         df['DayOfWeek'] = df['TransactionDate'].dt.dayofweek
         df['Month'] = df['TransactionDate'].dt.month
         df['DayIndex'] = (df['TransactionDate'] - df['TransactionDate'].min()).dt.days
 
-        # Rolling average (7 ngày) và Lag features, giữ nguyên tất cả các cột cần thiết
+        # Rolling average (7 ngày) và Lag features
         agg_dict = {
             'Quantity': 'sum',
             'IsHoliday': 'first',
@@ -53,8 +53,9 @@ class ProductForecaster:
             'Month': 'first',
             'DayIndex': 'first'
         }
-        df = df.groupby(['TransactionDate', 'ProductID']).agg(agg_dict).reset_index()
-        df = df.sort_values('TransactionDate')
+        # Nhóm theo ngày, sản phẩm và giờ, không thêm Hour vào agg_dict vì nó đã là key
+        df = df.groupby(['TransactionDate', 'ProductID', 'Hour']).agg(agg_dict).reset_index()
+        df = df.sort_values(['TransactionDate', 'Hour'])
 
         for product_id in df['ProductID'].unique():
             mask = df['ProductID'] == product_id
@@ -67,12 +68,14 @@ class ProductForecaster:
         # Mã hóa Weather
         df['Weather'] = self.label_encoders['Weather'].fit_transform(df['Weather'])
 
+        # Định nghĩa feature_columns với Hour
         self.feature_columns = ['DayOfWeek', 'Month', 'IsHoliday', 'IsWeekend', 'Weather',
-                                'RollingAvg7', 'Lag1', 'DayIndex']
+                                'RollingAvg7', 'Lag1', 'DayIndex', 'Hour']
         return df
 
     def train(self, historical_data: pd.DataFrame):
         logger.info("Starting XGBoost training for product forecast")
+        self.historical_data = historical_data  # Lưu dữ liệu để dùng trong predict
         df = self.preprocess_data(historical_data)
         products = df['ProductID'].unique()
 
@@ -124,7 +127,8 @@ class ProductForecaster:
             'Weather': ['Nắng'],
             'RollingAvg7': [0],
             'Lag1': [0],
-            'DayIndex': [(date - self.historical_data['TransactionDate'].min()).days]
+            'DayIndex': [(date - self.historical_data['TransactionDate'].min()).days],
+            'Hour': [12]  # Thêm Hour mặc định
         })
 
         for product_id in self.models.keys():
@@ -153,25 +157,24 @@ class ProductForecaster:
                 hours = hourly_map.get(time_range, [12])
                 for hour in hours:
                     pred_input = predict_date.copy()
-                    pred_input['Hour'] = hour
-                    pred = max(0,
-                               float(model.predict(pred_input[self.feature_columns].values)[0]))  # Ép kiểu sang float
-                    hourly_dist.append({
-                        'hour': f"{hour:02d}:00-{(hour + 1) % 24:02d}:00",
-                        'percentage': float(pred / len(hours) / len(time_ranges) * 100)  # Ép kiểu sang float
-                    })
+                    pred_input['Hour'] = hour  # Cập nhật Hour cho mỗi dự đoán
+                    pred = max(0, float(model.predict(pred_input[self.feature_columns].values)[0]))
                     total_pred += pred
+                    hourly_dist.append({'hour': f"{hour:02d}:00-{(hour + 1) % 24:02d}:00", 'pred': pred})
 
-            lower = max(0, float(total_pred * 0.9))  # Ép kiểu sang float
-            upper = float(total_pred * 1.1)  # Ép kiểu sang float
+            for dist in hourly_dist:
+                dist['percentage'] = float(dist['pred'] / total_pred * 100) if total_pred > 0 else 0.0
+
+            lower = max(0, float(total_pred * 0.9))
+            upper = float(total_pred * 1.1)
 
             predictions.append({
                 'product_id': int(product_id),
                 'product_name': product['Name'],
                 'category': product['Category'],
-                'predicted_quantity': float(total_pred),  # Ép kiểu sang float
+                'predicted_quantity': float(total_pred),
                 'confidence_interval': {'lower': lower, 'upper': upper},
-                'hourly_distribution': hourly_dist
+                'hourly_distribution': [{'hour': d['hour'], 'percentage': d['percentage']} for d in hourly_dist]
             })
 
         return predictions
