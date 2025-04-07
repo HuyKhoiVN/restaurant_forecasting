@@ -27,6 +27,9 @@ class ProductForecaster:
         df = df[df['Quantity'] > 0]
 
         # Xử lý thiếu
+        if 'Weather' not in df.columns:
+            logger.warning("Column 'Weather' not found in input data. Adding with default 'Unknown'")
+            df['Weather'] = 'Unknown'
         df['Weather'] = df['Weather'].fillna('Unknown')
         df['IsHoliday'] = df['IsHoliday'].astype(int)
         df['IsWeekend'] = df['IsWeekend'].astype(int)
@@ -40,9 +43,19 @@ class ProductForecaster:
         df['Month'] = df['TransactionDate'].dt.month
         df['DayIndex'] = (df['TransactionDate'] - df['TransactionDate'].min()).dt.days
 
-        # Rolling average (7 ngày) và Lag features
-        df = df.groupby(['TransactionDate', 'ProductID']).agg({'Quantity': 'sum'}).reset_index()
+        # Rolling average (7 ngày) và Lag features, giữ nguyên tất cả các cột cần thiết
+        agg_dict = {
+            'Quantity': 'sum',
+            'IsHoliday': 'first',
+            'IsWeekend': 'first',
+            'Weather': 'first',
+            'DayOfWeek': 'first',
+            'Month': 'first',
+            'DayIndex': 'first'
+        }
+        df = df.groupby(['TransactionDate', 'ProductID']).agg(agg_dict).reset_index()
         df = df.sort_values('TransactionDate')
+
         for product_id in df['ProductID'].unique():
             mask = df['ProductID'] == product_id
             df.loc[mask, 'RollingAvg7'] = df.loc[mask, 'Quantity'].rolling(window=7, min_periods=1).mean()
@@ -53,10 +66,6 @@ class ProductForecaster:
 
         # Mã hóa Weather
         df['Weather'] = self.label_encoders['Weather'].fit_transform(df['Weather'])
-
-        # Merge lại metadata
-        metadata = data[['TransactionDate', 'IsHoliday', 'IsWeekend', 'Weather']].drop_duplicates()
-        df = df.merge(metadata, on='TransactionDate', how='left')
 
         self.feature_columns = ['DayOfWeek', 'Month', 'IsHoliday', 'IsWeekend', 'Weather',
                                 'RollingAvg7', 'Lag1', 'DayIndex']
@@ -104,13 +113,13 @@ class ProductForecaster:
         logger.debug(f"Predicting product quantities for {date}")
         if not self.models:
             raise ValueError("Model not trained yet")
-        if not products_info:
+        if products_info is None or products_info.empty:
             raise ValueError("Product info required for prediction")
 
         predict_date = pd.DataFrame({
             'TransactionDate': [date],
-            'TransactionTime': [timedelta(hours=12)],  # Mặc định giữa ngày
-            'IsHoliday': [1 if date in self.holidays['ds'].values else 0],
+            'TransactionTime': [timedelta(hours=12)],
+            'IsHoliday': [1 if self.holidays is not None and date in self.holidays['ds'].values else 0],
             'IsWeekend': [1 if date.weekday() >= 5 else 0],
             'Weather': ['Nắng'],
             'RollingAvg7': [0],
@@ -145,22 +154,23 @@ class ProductForecaster:
                 for hour in hours:
                     pred_input = predict_date.copy()
                     pred_input['Hour'] = hour
-                    pred = max(0, model.predict(pred_input[self.feature_columns].values)[0])
+                    pred = max(0,
+                               float(model.predict(pred_input[self.feature_columns].values)[0]))  # Ép kiểu sang float
                     hourly_dist.append({
                         'hour': f"{hour:02d}:00-{(hour + 1) % 24:02d}:00",
-                        'percentage': pred / len(hours) / len(time_ranges) * 100
+                        'percentage': float(pred / len(hours) / len(time_ranges) * 100)  # Ép kiểu sang float
                     })
                     total_pred += pred
 
-            lower = max(0, total_pred * 0.9)
-            upper = total_pred * 1.1
+            lower = max(0, float(total_pred * 0.9))  # Ép kiểu sang float
+            upper = float(total_pred * 1.1)  # Ép kiểu sang float
 
             predictions.append({
                 'product_id': int(product_id),
                 'product_name': product['Name'],
                 'category': product['Category'],
-                'predicted_quantity': float(total_pred),
-                'confidence_interval': {'lower': float(lower), 'upper': float(upper)},
+                'predicted_quantity': float(total_pred),  # Ép kiểu sang float
+                'confidence_interval': {'lower': lower, 'upper': upper},
                 'hourly_distribution': hourly_dist
             })
 

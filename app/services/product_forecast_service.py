@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List
 from app.database import get_db
-from app.ml.product.xgboost_model import ProductForecaster
+from app.ml.sales.xgboost_model import ProductForecaster  # Giữ import theo cấu trúc của bạn
 from app.ml.revenue.prophet_model import ProphetForecaster
 
 logging.basicConfig(level=logging.DEBUG)
@@ -39,6 +39,15 @@ class ProductForecastService:
         raw_data = pd.read_sql(query, db.connection())
         raw_data['TransactionDate'] = pd.to_datetime(raw_data['TransactionDate'])
         raw_data['TransactionTime'] = pd.to_timedelta(raw_data['TransactionTime'].astype(str))
+
+        # Log các cột để debug
+        logger.debug(f"Columns in raw_data: {list(raw_data.columns)}")
+
+        # Kiểm tra và xử lý cột Weather nếu thiếu
+        if 'Weather' not in raw_data.columns:
+            logger.warning("Column 'Weather' not found in data. Filling with 'Unknown'")
+            raw_data['Weather'] = 'Unknown'
+        raw_data['Weather'] = raw_data['Weather'].fillna('Unknown')
 
         self.historical_data = raw_data
         logger.info(f"Loaded {len(self.historical_data)} rows of historical product data")

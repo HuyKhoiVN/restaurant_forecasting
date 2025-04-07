@@ -17,4 +17,4 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 app.include_router(revenue.router, prefix="/api/revenue", tags=["Revenue"])
-app.include_router(product_forecast.router, prefix="/api/product", tags=["ProForecast"])
+app.include_router(product_forecast.router, prefix="/api/product", tags=["product_forecast"])
