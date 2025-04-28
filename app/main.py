@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.api import revenue, product_forecast
+from app.api import revenue, product_forecast, inventory
 import logging
 
 # Cấu hình logging
@@ -18,3 +18,4 @@ app = FastAPI()
 
 app.include_router(revenue.router, prefix="/api/revenue", tags=["Revenue"])
 app.include_router(product_forecast.router, prefix="/api/product", tags=["product_forecast"])
+app.include_router(inventory.router, prefix="/api/inventory", tags=["Inventory"])
